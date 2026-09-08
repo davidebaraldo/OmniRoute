@@ -9,6 +9,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  CLAUDE_LIMIT_RESET_RECENT_WINDOW_MS,
   CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS,
   CLAUDE_LIMIT_RESET_STATUS_URL,
   _resetClaudeLimitResetMemo,
@@ -277,6 +278,55 @@ test("attempt: claim 401/403 → auth_error, 429 → rate_limited (both non-fata
     assert.equal(r.reset, false, String(status));
     assert.equal(r.outcome, outcome, String(status));
   }
+});
+
+test("attempt: concurrent wall hits share one status+claim round trip (no duplicate POST)", async () => {
+  const { calls, fetchImpl } = mockFetch({
+    [CLAUDE_LIMIT_RESET_STATUS_URL]: () =>
+      json({ juniper_tide: { eligible: true, arm: "reset", available: true } }),
+    [CLAIM_PREFIX]: () => json({ result: "reset", next_available_at: "2026-09-15T00:00:00Z" }),
+  });
+  const opts = {
+    key: "c1",
+    accessToken: TOKEN,
+    providerSpecificData: { organizationUUID: "org-1" },
+    now: NOW,
+    fetchImpl,
+  };
+  const [a, b, c] = await Promise.all([
+    attemptClaudeLimitReset(opts),
+    attemptClaudeLimitReset(opts),
+    attemptClaudeLimitReset(opts),
+  ]);
+  assert.equal(a.reset, true);
+  assert.deepEqual(b, a);
+  assert.deepEqual(c, a);
+  assert.equal(calls.filter((x) => x.method === "POST").length, 1, "exactly one claim");
+  assert.equal(calls.length, 2);
+});
+
+test("attempt: right after a granted reset, a stale sibling wall is answered reset:true without network", async () => {
+  const { calls, fetchImpl } = mockFetch({
+    [CLAUDE_LIMIT_RESET_STATUS_URL]: () =>
+      json({ juniper_tide: { eligible: true, arm: "reset", available: true } }),
+    [CLAIM_PREFIX]: () => json({ result: "reset" }),
+  });
+  const base = {
+    key: "c1",
+    accessToken: TOKEN,
+    providerSpecificData: { organizationUUID: "org-1" },
+    fetchImpl,
+  };
+  assert.equal((await attemptClaudeLimitReset({ ...base, now: NOW })).outcome, "reset");
+  const sibling = await attemptClaudeLimitReset({ ...base, now: NOW + 5_000 });
+  assert.deepEqual(sibling, { reset: true, outcome: "recent_reset", nextAvailableAt: null });
+  assert.equal(calls.length, 2, "no extra network for the sibling");
+  // Past the recent-reset window the weekly memo takes over (the reset is spent).
+  assert.equal(
+    (await attemptClaudeLimitReset({ ...base, now: NOW + CLAUDE_LIMIT_RESET_RECENT_WINDOW_MS + 1 }))
+      .outcome,
+    "memo_skip"
+  );
 });
 
 test("attempt: not_limited (window already reset server-side) counts as reset → retry at full speed", async () => {

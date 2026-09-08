@@ -212,7 +212,15 @@ export async function resolveClaudeOrganizationUuid(
   return bootstrap?.organization_uuid ?? null;
 }
 
+/**
+ * After a granted reset, sibling requests that hit the (now stale) wall in the same breath
+ * are told "reset: true" for this long instead of re-querying the server.
+ */
+export const CLAUDE_LIMIT_RESET_RECENT_WINDOW_MS = 60_000;
+
 const notBefore = new Map<string, number>();
+const recentResetUntil = new Map<string, number>();
+const inflight = new Map<string, Promise<ClaudeLimitResetAttempt>>();
 
 function parseIsoMs(value: string | null): number | undefined {
   if (!value) return undefined;
@@ -225,6 +233,7 @@ export type ClaudeLimitResetAttempt = {
   outcome:
     | "reset"
     | "not_limited"
+    | "recent_reset"
     | "memo_skip"
     | "no_status"
     | "not_offered"
@@ -251,11 +260,30 @@ export async function attemptClaudeLimitReset(opts: {
   } | null;
 }): Promise<ClaudeLimitResetAttempt> {
   const now = opts.now ?? Date.now();
-  const fetchImpl = opts.fetchImpl ?? fetch;
+  const recentUntil = recentResetUntil.get(opts.key);
+  if (recentUntil !== undefined && now < recentUntil) {
+    return { reset: true, outcome: "recent_reset", nextAvailableAt: null };
+  }
   const skipUntil = notBefore.get(opts.key);
   if (skipUntil !== undefined && now < skipUntil) {
     return { reset: false, outcome: "memo_skip", nextAvailableAt: null };
   }
+  // Parallel requests on one connection hit the wall together: run a single status+claim
+  // round trip and hand every caller the same verdict (no duplicate POST reset_rate_limits).
+  const pending = inflight.get(opts.key);
+  if (pending) return pending;
+  const run = runClaudeLimitResetAttempt(opts, now).finally(() => {
+    if (inflight.get(opts.key) === run) inflight.delete(opts.key);
+  });
+  inflight.set(opts.key, run);
+  return run;
+}
+
+async function runClaudeLimitResetAttempt(
+  opts: Parameters<typeof attemptClaudeLimitReset>[0],
+  now: number
+): Promise<ClaudeLimitResetAttempt> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
 
   const status = await fetchClaudeLimitResetStatus(opts.accessToken, fetchImpl);
   if (!status) {
@@ -294,6 +322,7 @@ export async function attemptClaudeLimitReset(opts: {
         opts.key,
         next !== undefined && next > now ? next : now + CLAUDE_LIMIT_RESET_WEEK_MS
       );
+      recentResetUntil.set(opts.key, now + CLAUDE_LIMIT_RESET_RECENT_WINDOW_MS);
       opts.log?.info?.(
         "CLAUDE_LIMIT_RESET",
         `${claim.result} — next reset available ${claim.nextAvailableAt ?? "in a week"}`
@@ -313,7 +342,9 @@ export async function attemptClaudeLimitReset(opts: {
   return { reset: false, outcome: claim.result, nextAvailableAt: claim.nextAvailableAt };
 }
 
-/** Test-only: forget every memoised "not before". */
+/** Test-only: forget every memoised "not before" / recent reset / in-flight attempt. */
 export function _resetClaudeLimitResetMemo(): void {
   notBefore.clear();
+  recentResetUntil.clear();
+  inflight.clear();
 }

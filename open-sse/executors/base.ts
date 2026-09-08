@@ -1448,7 +1448,9 @@ export class BaseExecutor {
           this.provider === "claude" && hasClaudeOAuthToken
             ? resolveClaudeUsageLimitKey(activeCredentials)
             : null;
-        if (claudeUsageLimitKey && isClaudeLowPriorityActive(claudeUsageLimitKey)) {
+        const claudeSentSlow =
+          claudeUsageLimitKey !== null && isClaudeLowPriorityActive(claudeUsageLimitKey);
+        if (claudeSentSlow) {
           finalHeaders[CLAUDE_USAGE_LIMIT_HEADER] = CLAUDE_USAGE_LIMIT_SLOW;
         }
         const serializedBody = prl.parseBody(bodyString);
@@ -1527,6 +1529,7 @@ export class BaseExecutor {
             config: usageLimitConfig,
             response,
             wait: claudeLowPriorityWait,
+            sentSlow: claudeSentSlow,
             claimLimitReset: () =>
               attemptClaudeLimitReset({
                 key: claudeUsageLimitKey,

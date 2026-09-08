@@ -417,6 +417,46 @@ test("active: ineligible + overage-in-use → extra usage now covers the wall, l
   assert.deepEqual(d, { kind: "ended", reason: "extra_usage" });
 });
 
+test("raced activation: a header-less sibling's wall 429 joins the lane instead of ending it", async () => {
+  // Request A activated the lane; request B was built while the lane was idle (no header)
+  // and now comes back with the same wall 429 — it must NOT be read as a lane verdict.
+  tryActivateClaudeLowPriority("c1", wall429Headers(), NOW);
+  const wait = createClaudeLowPriorityWait();
+  const d = await handleClaudeUsageLimitResponse({
+    key: "c1",
+    config: BOTH_ON,
+    response: { status: 429, headers: wall429Headers() },
+    wait,
+    sentSlow: false,
+    now: NOW + 10,
+  });
+  assert.deepEqual(d, { kind: "retry", delayMs: 0, via: "low-priority-accepted" });
+  assert.equal(isClaudeLowPriorityActive("c1", NOW + 10), true, "lane survives the sibling 429");
+
+  // A header-less 2xx while active is not lane telemetry either.
+  const d2 = await handleClaudeUsageLimitResponse({
+    key: "c1",
+    config: BOTH_ON,
+    response: { status: 200, headers: { "anthropic-ratelimit-unified-slow-status": "active" } },
+    wait,
+    sentSlow: false,
+    now: NOW + 20,
+  });
+  assert.deepEqual(d2, { kind: "none" });
+  assert.equal(getClaudeLowPrioritySnapshot("c1", NOW + 20).requestsServed, 0);
+
+  // With the header sent (default), the same wall 429 without a slow verdict IS a wall → end.
+  const d3 = await handleClaudeUsageLimitResponse({
+    key: "c1",
+    config: BOTH_ON,
+    response: { status: 429, headers: wall429Headers() },
+    wait,
+    sentSlow: true,
+    now: NOW + 30,
+  });
+  assert.deepEqual(d3, { kind: "ended", reason: "wall" });
+});
+
 test("state is per connection", () => {
   tryActivateClaudeLowPriority("c1", wall429Headers(), NOW);
   assert.equal(isClaudeLowPriorityActive("c1", NOW), true);

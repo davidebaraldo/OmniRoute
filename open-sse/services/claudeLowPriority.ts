@@ -492,22 +492,36 @@ export async function handleClaudeUsageLimitResponse(opts: {
   wait: ClaudeLowPriorityWait;
   /** Attempts the `/limit-reset` claim; resolves true when the 5h window was reset. */
   claimLimitReset?: () => Promise<boolean>;
+  /**
+   * Whether THIS request went out with `anthropic-usage-limit: slow`. Two requests on the
+   * same connection can hit the wall together: the first one activates the lane, the second
+   * one's 429 (built while the lane was still idle, so without the header) must not be read
+   * as a verdict on the lane — it just joins it. Defaults to "matches the lane state".
+   */
+  sentSlow?: boolean;
   now?: number;
   random?: () => number;
 }): Promise<ClaudeUsageLimitDecision> {
   const now = opts.now ?? Date.now();
   const { key, config, response, wait } = opts;
+  const headers = response.headers;
+  const offer = parseClaudeSlowOffer(headers);
+  const atWall = isClaudeUsageWall(headers) || offer !== undefined;
 
   if (isClaudeLowPriorityActive(key, now)) {
+    if (opts.sentSlow === false) {
+      // Raced activation (see `sentSlow`): a header-less request's outcome is not lane
+      // telemetry. Re-send it on the lane if it hit the wall, otherwise ignore it.
+      if (response.status === 429 && atWall) {
+        return { kind: "retry", delayMs: 0, via: "low-priority-accepted" };
+      }
+      return { kind: "none" };
+    }
     return observeClaudeLowPriorityResponse(key, response, wait, now, opts.random);
   }
 
   if (response.status !== 429) return { kind: "none" };
   if (!config.lowPriorityMode && !config.autoLimitReset) return { kind: "none" };
-
-  const headers = response.headers;
-  const offer = parseClaudeSlowOffer(headers);
-  const atWall = isClaudeUsageWall(headers) || offer !== undefined;
   if (!atWall) return { kind: "none" };
 
   if (config.autoLimitReset && opts.claimLimitReset) {
