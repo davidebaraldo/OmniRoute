@@ -30,7 +30,11 @@ import {
   addParamToBlocklist,
   isAutoLearnGloballyEnabled,
 } from "@/lib/db/paramFilters";
-import { applyFingerprint, isCliCompatEnabled, stripInternalBodyFields } from "../config/cliFingerprints.ts";
+import {
+  applyFingerprint,
+  isCliCompatEnabled,
+  stripInternalBodyFields,
+} from "../config/cliFingerprints.ts";
 import { supportsClaudeMaxEffort, supportsXHighEffort } from "../config/providerModels.ts";
 import { getThinkingBudgetConfig, ThinkingMode } from "../services/thinkingBudget.ts";
 import {
@@ -40,6 +44,16 @@ import {
   isFreeVariantModel,
 } from "../services/openrouterFreeWindow.ts";
 import { gateOutboundRequest } from "../services/wafRateLimit.ts";
+import {
+  CLAUDE_USAGE_LIMIT_HEADER,
+  CLAUDE_USAGE_LIMIT_SLOW,
+  createClaudeLowPriorityWait,
+  handleClaudeUsageLimitResponse,
+  isClaudeLowPriorityActive,
+  readClaudeUsageLimitConfig,
+  resolveClaudeUsageLimitKey,
+} from "../services/claudeLowPriority.ts";
+import { attemptClaudeLimitReset } from "../services/claudeLimitReset.ts";
 import type { PoolConfig } from "../services/sessionPool/types.ts";
 import type { Session } from "../services/sessionPool/session.ts";
 import { SessionPool } from "../services/sessionPool/sessionPool.ts";
@@ -726,6 +740,9 @@ export class BaseExecutor {
     let activeCredentials = credentials;
     // Track per-URL intra-retry attempts to avoid infinite loops
     const retryAttemptsByUrl: Record<number, number> = {};
+    // Claude OAuth lower-priority lane: per-execute() wait accounting for the
+    // slot_busy/529 retry loop (bounded by the server's slow-max-wait).
+    const claudeLowPriorityWait = createClaudeLowPriorityWait();
 
     // Probe-origin dispatches must not consume a refresh-token rotation —
     // routing state untouched; the reactive 401/403 path is probe-guarded
@@ -1422,6 +1439,18 @@ export class BaseExecutor {
         // Enforce peer tracing after all configurable headers have been merged so
         // operator/provider metadata cannot accidentally erase the loop guard.
         applyPeerTraceHeader(finalHeaders, clientHeaders, url);
+        // Claude OAuth lower-priority lane (mirror of Claude Code's /low-priority):
+        // once this account accepted the slow-lane offer on its 5-hour usage wall,
+        // every request rides `anthropic-usage-limit: slow` until the window resets.
+        // Opt-in per connection (providerSpecificData.lowPriorityMode); never sent
+        // before the first wall 429. See open-sse/services/claudeLowPriority.ts.
+        const claudeUsageLimitKey =
+          this.provider === "claude" && hasClaudeOAuthToken
+            ? resolveClaudeUsageLimitKey(activeCredentials)
+            : null;
+        if (claudeUsageLimitKey && isClaudeLowPriorityActive(claudeUsageLimitKey)) {
+          finalHeaders[CLAUDE_USAGE_LIMIT_HEADER] = CLAUDE_USAGE_LIMIT_SLOW;
+        }
         const serializedBody = prl.parseBody(bodyString);
         // #4307 — Preserve the non-enumerable tool-name cloak/remap reverse map
         // (`_toolNameMap`, set on the live `transformedBody` by
@@ -1482,6 +1511,56 @@ export class BaseExecutor {
         }
 
         let response = await fetchWithStartTimeout(url, fetchOptions);
+
+        // Claude OAuth usage wall: accept the slow-lane offer / claim the weekly
+        // session-limit reset and retry the SAME account instead of surfacing the
+        // 429 (which would cool the connection down). While the lane is active,
+        // slot_busy (429) and capacity (529) verdicts wait the server-announced
+        // retry-after and retry, bounded by slow-max-wait.
+        if (claudeUsageLimitKey) {
+          const usageLimitConfig = readClaudeUsageLimitConfig(
+            activeCredentials?.providerSpecificData
+          );
+          const accessToken = activeCredentials?.accessToken ?? "";
+          const decision = await handleClaudeUsageLimitResponse({
+            key: claudeUsageLimitKey,
+            config: usageLimitConfig,
+            response,
+            wait: claudeLowPriorityWait,
+            claimLimitReset: () =>
+              attemptClaudeLimitReset({
+                key: claudeUsageLimitKey,
+                accessToken,
+                providerSpecificData: activeCredentials?.providerSpecificData,
+                log,
+              }).then((attempt) => attempt.reset),
+          });
+          if (decision.kind === "retry") {
+            log?.info?.(
+              "CLAUDE_LOW_PRIORITY",
+              `${decision.via} on ${url} — retrying same account in ${decision.delayMs}ms`
+            );
+            if (decision.delayMs > 0) {
+              await new Promise<void>((resolve, reject) => {
+                const timer = setTimeout(() => {
+                  signal?.removeEventListener("abort", onAbort);
+                  resolve();
+                }, decision.delayMs);
+                const onAbort = () => {
+                  clearTimeout(timer);
+                  reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+                };
+                if (signal?.aborted) return onAbort();
+                signal?.addEventListener("abort", onAbort, { once: true });
+              });
+            }
+            urlIndex--; // re-run this urlIndex (header injection sees the new lane state)
+            continue;
+          }
+          if (decision.kind === "ended") {
+            log?.info?.("CLAUDE_LOW_PRIORITY", `lane ended (${decision.reason}) on ${url}`);
+          }
+        }
 
         if (openrouterFreeWindowAccountKey) {
           correctFromRateLimitHeaders(openrouterFreeWindowAccountKey, response.headers);

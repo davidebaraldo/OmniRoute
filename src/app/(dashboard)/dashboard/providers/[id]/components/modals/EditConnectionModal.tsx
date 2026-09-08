@@ -157,6 +157,8 @@ export default function EditConnectionModal({
         : false,
     passthroughModels: connectionProviderSpecificData?.passthroughModels === true,
     disableCooling: connectionProviderSpecificData?.disableCooling === true,
+    lowPriorityMode: connectionProviderSpecificData?.lowPriorityMode === true,
+    autoLimitReset: connectionProviderSpecificData?.autoLimitReset === true,
     importFreeModelsOnly: connectionProviderSpecificData?.importFreeModelsOnly === true,
     tunnelId: stringField(connectionProviderSpecificData?.tunnelId),
     runtimeKey: "",
@@ -403,6 +405,8 @@ export default function EditConnectionModal({
         ),
         passthroughModels: connection?.providerSpecificData?.passthroughModels === true,
         disableCooling: connection?.providerSpecificData?.disableCooling === true,
+        lowPriorityMode: connection?.providerSpecificData?.lowPriorityMode === true,
+        autoLimitReset: connection?.providerSpecificData?.autoLimitReset === true,
         importFreeModelsOnly: connection?.providerSpecificData?.importFreeModelsOnly === true,
         tunnelId: stringField(connection.providerSpecificData?.tunnelId),
         runtimeKey: "",
@@ -699,6 +703,8 @@ export default function EditConnectionModal({
         };
         if (isClaude) {
           updates.providerSpecificData.blockExtraUsage = formData.blockExtraUsage;
+          updates.providerSpecificData.lowPriorityMode = formData.lowPriorityMode;
+          updates.providerSpecificData.autoLimitReset = formData.autoLimitReset;
         }
         if (isCodex) {
           updates.providerSpecificData.requestDefaults = {
@@ -850,6 +856,22 @@ export default function EditConnectionModal({
               label={t("blockClaudeExtraUsageLabel")}
               description={t("blockClaudeExtraUsageDescription")}
             />
+            {isOAuth && (
+              <>
+                <Toggle
+                  checked={formData.lowPriorityMode}
+                  onChange={(checked) => setFormData({ ...formData, lowPriorityMode: checked })}
+                  label={t("claudeLowPriorityModeLabel")}
+                  description={t("claudeLowPriorityModeDescription")}
+                />
+                <Toggle
+                  checked={formData.autoLimitReset}
+                  onChange={(checked) => setFormData({ ...formData, autoLimitReset: checked })}
+                  label={t("claudeAutoLimitResetLabel")}
+                  description={t("claudeAutoLimitResetDescription")}
+                />
+              </>
+            )}
           </div>
         )}
         {(isCcCompatible || openRouterPreset.input) && (
