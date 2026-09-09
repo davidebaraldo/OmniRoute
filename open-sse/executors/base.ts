@@ -6,8 +6,9 @@ import {
   type AlternateFormat,
 } from "../config/providers/alternateFormats.ts";
 import {
-  CLAUDE_CLI_STAINLESS_RUNTIME_VERSION,
+  applyStainlessHeaders,
   getClaudeCliBillingVersion,
+  mergeCcHeaders,
   mergeClientAnthropicBeta,
   normalizeAnthropicHeaderVariants,
 } from "../config/anthropicHeaders.ts";
@@ -44,19 +45,7 @@ import {
   isFreeVariantModel,
 } from "../services/openrouterFreeWindow.ts";
 import { gateOutboundRequest } from "../services/wafRateLimit.ts";
-import {
-  CLAUDE_USAGE_LIMIT_HEADER,
-  CLAUDE_USAGE_LIMIT_SLOW,
-  createClaudeLowPriorityWait,
-  handleClaudeUsageLimitResponse,
-  isClaudeLowPriorityActive,
-  readClaudeUsageLimitConfig,
-  resolveClaudeUsageLimitKey,
-} from "../services/claudeLowPriority.ts";
-import { attemptClaudeLimitReset } from "../services/claudeLimitReset.ts";
-
-/** Safety margin kept between the last lane wait and this request's upstream timeout. */
-const CLAUDE_USAGE_LIMIT_WAIT_MARGIN_MS = 5_000;
+import { ClaudeUsageLimitGuard } from "./claudeUsageLimit.ts";
 import type { PoolConfig } from "../services/sessionPool/types.ts";
 import type { Session } from "../services/sessionPool/session.ts";
 import { SessionPool } from "../services/sessionPool/sessionPool.ts";
@@ -114,6 +103,7 @@ import {
   selectBetaFlags,
   stainlessArch,
   stainlessOS,
+  stripClaudeSystemPrefixBlocks,
   stripProxyToolPrefix,
 } from "./claudeIdentity.ts";
 import { withForcedResponsesUpstream } from "./forceResponsesUpstream.ts";
@@ -743,11 +733,8 @@ export class BaseExecutor {
     let activeCredentials = credentials;
     // Track per-URL intra-retry attempts to avoid infinite loops
     const retryAttemptsByUrl: Record<number, number> = {};
-    // Claude OAuth lower-priority lane: per-execute() wait accounting for the
-    // slot_busy/529 retry loop (bounded by the server's slow-max-wait AND by what is
-    // left of this request's own upstream timeout — see usageLimitWaitCeilingMs below).
-    const claudeLowPriorityWait = createClaudeLowPriorityWait();
-    const claudeUsageLimitStartedAtMs = Date.now();
+    // Claude OAuth usage wall (opt-in per connection): see ./claudeUsageLimit.ts.
+    const claudeUsageLimit = new ClaudeUsageLimitGuard(this.provider, log);
 
     // Probe-origin dispatches must not consume a refresh-token rotation —
     // routing state untouched; the reactive 401/403 path is probe-guarded
@@ -1197,18 +1184,7 @@ export class BaseExecutor {
           // Strip any pre-existing billing/sentinel before re-prepending — keeps
           // retries idempotent and avoids stacking that breaks prompt-cache prefix
           // matching (see issue #1712).
-          for (let i = sysBlocks.length - 1; i >= 0; i--) {
-            const t = sysBlocks[i]?.text;
-            if (typeof t === "string" && t.startsWith("x-anthropic-billing-header:")) {
-              sysBlocks.splice(i, 1);
-            }
-          }
-          for (let i = sysBlocks.length - 1; i >= 0; i--) {
-            const t = sysBlocks[i]?.text;
-            if (typeof t === "string" && t.startsWith(SENTINEL)) {
-              sysBlocks.splice(i, 1);
-            }
-          }
+          stripClaudeSystemPrefixBlocks(sysBlocks, SENTINEL);
           sysBlocks.unshift({ type: "text", text: billingLine }, { type: "text", text: SENTINEL });
           tb.system = sysBlocks;
           normalizeCacheControlTtl(tb);
@@ -1290,29 +1266,14 @@ export class BaseExecutor {
               "X-Claude-Code-Session-Id": sessionId,
             };
 
-            // Drop case variants of the same header name before merging — undici
-            // would otherwise concatenate them (issue #1454).
-            const ccKeysLower = new Set(Object.keys(ccHeaders).map((k) => k.toLowerCase()));
-            for (const key of Object.keys(headers)) {
-              if (ccKeysLower.has(key.toLowerCase())) delete headers[key];
-            }
-            Object.assign(headers, ccHeaders);
+            mergeCcHeaders(headers, ccHeaders);
             if (usesCcWireImage(this.provider) && usesClaudeCodeProtocol) {
               delete headers["Authorization"];
               headers["x-api-key"] =
                 activeCredentials?.apiKey || activeCredentials?.accessToken || "";
             }
             delete headers["X-Stainless-Helper-Method"];
-
-            // OS/arch follow the host running the signed binary. Runtime version
-            // is pinned to the captured CLI wire image, not OmniRoute's Node.
-            headers["X-Stainless-Arch"] = stainlessArch();
-            headers["X-Stainless-Lang"] = "js";
-            headers["X-Stainless-OS"] = stainlessOS();
-            headers["X-Stainless-Runtime"] = "node";
-            headers["X-Stainless-Runtime-Version"] = CLAUDE_CLI_STAINLESS_RUNTIME_VERSION;
-            headers["X-Stainless-Retry-Count"] = "0";
-            delete headers["X-Stainless-Os"];
+            applyStainlessHeaders(headers, { arch: stainlessArch(), os: stainlessOS() });
           }
           // selectBetaFlags() above always includes redact-thinking for an
           // "opaque" client (no client-negotiated anthropic-beta) — correct
@@ -1444,20 +1405,8 @@ export class BaseExecutor {
         // Enforce peer tracing after all configurable headers have been merged so
         // operator/provider metadata cannot accidentally erase the loop guard.
         applyPeerTraceHeader(finalHeaders, clientHeaders, url);
-        // Claude OAuth lower-priority lane (mirror of Claude Code's /low-priority):
-        // once this account accepted the slow-lane offer on its 5-hour usage wall,
-        // every request rides `anthropic-usage-limit: slow` until the window resets.
-        // Opt-in per connection (providerSpecificData.lowPriorityMode); never sent
-        // before the first wall 429. See open-sse/services/claudeLowPriority.ts.
-        const claudeUsageLimitKey =
-          this.provider === "claude" && hasClaudeOAuthToken
-            ? resolveClaudeUsageLimitKey(activeCredentials)
-            : null;
-        const claudeSentSlow =
-          claudeUsageLimitKey !== null && isClaudeLowPriorityActive(claudeUsageLimitKey);
-        if (claudeSentSlow) {
-          finalHeaders[CLAUDE_USAGE_LIMIT_HEADER] = CLAUDE_USAGE_LIMIT_SLOW;
-        }
+        // Rides `anthropic-usage-limit: slow` once this account accepted the offer.
+        const claudeSentSlow = claudeUsageLimit.applyHeader(finalHeaders, activeCredentials);
         const serializedBody = prl.parseBody(bodyString);
         // #4307 — Preserve the non-enumerable tool-name cloak/remap reverse map
         // (`_toolNameMap`, set on the live `transformedBody` by
@@ -1707,73 +1656,18 @@ export class BaseExecutor {
         }
 
         // Claude OAuth usage wall: accept the slow-lane offer / claim the weekly
-        // session-limit reset and retry the SAME account instead of surfacing the
-        // 429 (which would cool the connection down). While the lane is active,
-        // slot_busy (429) and capacity (529) verdicts wait the server-announced
-        // retry-after and retry, bounded by slow-max-wait.
-        //
-        // Runs AFTER every 400-driven intra-iteration retry above (context editing,
-        // thinking/effort clamps, param auto-learn) so it classifies the FINAL response
-        // of this attempt — a wall 429 that only surfaces on one of those retries would
-        // otherwise slip through to the generic 429 path and cool the connection down.
-        if (claudeUsageLimitKey) {
-          const usageLimitConfig = readClaudeUsageLimitConfig(
-            activeCredentials?.providerSpecificData
-          );
-          const accessToken = activeCredentials?.accessToken ?? "";
-          // The request's own upstream-start timeout aborts this whole execute() call, so a
-          // lane wait must finish inside what is left of it: without this ceiling the default
-          // 20-minute slow-max-wait outlives the 10-minute default timeout and the sleep is
-          // killed mid-wait, surfacing a TimeoutError instead of the graceful max_wait end.
-          const usageLimitWaitCeilingMs =
-            fetchStartTimeoutMs > 0
-              ? Math.max(
-                  0,
-                  fetchStartTimeoutMs -
-                    (Date.now() - claudeUsageLimitStartedAtMs) -
-                    CLAUDE_USAGE_LIMIT_WAIT_MARGIN_MS
-                )
-              : undefined;
-          const decision = await handleClaudeUsageLimitResponse({
-            key: claudeUsageLimitKey,
-            config: usageLimitConfig,
-            response,
-            wait: claudeLowPriorityWait,
-            sentSlow: claudeSentSlow,
-            waitCeilingMs: usageLimitWaitCeilingMs,
-            claimLimitReset: () =>
-              attemptClaudeLimitReset({
-                key: claudeUsageLimitKey,
-                accessToken,
-                providerSpecificData: activeCredentials?.providerSpecificData,
-                log,
-              }).then((attempt) => attempt.reset),
-          });
-          if (decision.kind === "retry") {
-            log?.info?.(
-              "CLAUDE_LOW_PRIORITY",
-              `${decision.via} on ${url} — retrying same account in ${decision.delayMs}ms`
-            );
-            if (decision.delayMs > 0) {
-              await new Promise<void>((resolve, reject) => {
-                const timer = setTimeout(() => {
-                  signal?.removeEventListener("abort", onAbort);
-                  resolve();
-                }, decision.delayMs);
-                const onAbort = () => {
-                  clearTimeout(timer);
-                  reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
-                };
-                if (signal?.aborted) return onAbort();
-                signal?.addEventListener("abort", onAbort, { once: true });
-              });
-            }
-            urlIndex--; // re-run this urlIndex (header injection sees the new lane state)
-            continue;
-          }
-          if (decision.kind === "ended") {
-            log?.info?.("CLAUDE_LOW_PRIORITY", `lane ended (${decision.reason}) on ${url}`);
-          }
+        // session-limit reset and retry the SAME account instead of surfacing the 429
+        // (which would cool the connection down). Runs AFTER every 400-driven retry
+        // above so it classifies the FINAL response of this attempt.
+        const claudeRetry = await claudeUsageLimit.shouldRetry(response, url, {
+          credentials: activeCredentials,
+          signal,
+          budgetMs: fetchStartTimeoutMs,
+          sentSlow: claudeSentSlow,
+        });
+        if (claudeRetry) {
+          urlIndex--; // re-run this urlIndex (header injection sees the new lane state)
+          continue;
         }
 
         // Intra-URL retry: agentrouter.org WAF returns 400 content-blocked

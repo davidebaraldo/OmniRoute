@@ -459,6 +459,69 @@ function waitOrGiveUp(
   return { kind: "retry", delayMs, via };
 }
 
+/** Error-status half of the observation: terminal verdict, slot/capacity wait, or nothing. */
+function observeErrorResponse(
+  ctx: ObserveContext,
+  status: number,
+  slowStatus: ClaudeSlowStatus | undefined
+): ClaudeUsageLimitDecision {
+  const { key, entry, headers, wait, now, random, waitCeilingMs } = ctx;
+  if (status === 429) {
+    const reason = mapEndReason(slowStatus, headers);
+    if (reason) {
+      if (reason === "budget") recordBudgetSpent(entry, headers, now);
+      endEntry(key, entry, reason, now);
+      return { kind: "ended", reason };
+    }
+    if (slowStatus === "slot_busy") {
+      return waitOrGiveUp(key, entry, wait, "slot-busy", now, random, waitCeilingMs);
+    }
+    return { kind: "none" };
+  }
+  return waitOrGiveUp(key, entry, wait, "capacity-busy", now, random, waitCeilingMs);
+}
+
+/** Success half: window rollover, served counters, or the overage takeover. */
+function observeSuccessResponse(
+  ctx: ObserveContext,
+  slowStatus: ClaudeSlowStatus | undefined
+): ClaudeUsageLimitDecision {
+  const { key, entry, headers, wait, now } = ctx;
+  if (entry.state.phase !== "active") return { kind: "none" };
+
+  // Window rollover announced by the server → the wall is gone, drop the header.
+  const reset5h = parseClaudeHeaderNumber(headers, CLAUDE_UNIFIED_HEADERS.reset5h);
+  if (
+    reset5h !== undefined &&
+    reset5h >= entry.state.resetsAtSeconds + D.rolloverToleranceSeconds
+  ) {
+    endEntry(key, entry, "reset", now);
+    return { kind: "ended", reason: "reset" };
+  }
+
+  if (slowStatus === "active") {
+    entry.requestsServed += 1;
+    wait.current = null;
+  } else if (slowStatus === "not_needed") {
+    entry.requestsServedStandard += 1;
+    wait.current = null;
+  } else if (isOverageTakeover(slowStatus, headers)) {
+    endEntry(key, entry, "extra_usage", now);
+    return { kind: "ended", reason: "extra_usage" };
+  }
+  return { kind: "none" };
+}
+
+type ObserveContext = {
+  key: string;
+  entry: Entry;
+  headers: HeaderSource;
+  wait: ClaudeLowPriorityWait;
+  now: number;
+  random: () => number;
+  waitCeilingMs?: number;
+};
+
 /**
  * Observe an upstream response for an ACTIVE lane: keeps counters/hints fresh, ends the
  * lane on terminal verdicts, and asks for a same-account retry on `slot_busy` (429) or
@@ -472,50 +535,22 @@ export function observeClaudeLowPriorityResponse(
   random: () => number = Math.random,
   waitCeilingMs?: number
 ): ClaudeUsageLimitDecision {
-  const e = entries.get(key);
-  if (!e) return { kind: "none" };
-  expireIfPastReset(key, e, now);
-  if (e.state.phase !== "active") return { kind: "none" };
+  const entry = entries.get(key);
+  if (!entry) return { kind: "none" };
+  expireIfPastReset(key, entry, now);
+  if (entry.state.phase !== "active") return { kind: "none" };
 
   const headers = response.headers;
   const slowStatus = parseClaudeSlowStatus(headers);
-  applyWaitHints(e, headers);
+  applyWaitHints(entry, headers);
+  const ctx: ObserveContext = { key, entry, headers, wait, now, random, waitCeilingMs };
 
-  if (response.status === 429) {
-    const reason = mapEndReason(slowStatus, headers);
-    if (reason) {
-      if (reason === "budget") recordBudgetSpent(e, headers, now);
-      endEntry(key, e, reason, now);
-      return { kind: "ended", reason };
-    }
-    if (slowStatus === "slot_busy") {
-      return waitOrGiveUp(key, e, wait, "slot-busy", now, random, waitCeilingMs);
-    }
-    return { kind: "none" };
+  const isCapacityWait =
+    response.status === 529 && (slowStatus === "active" || slowStatus === undefined);
+  if (response.status === 429 || isCapacityWait) {
+    return observeErrorResponse(ctx, response.status, slowStatus);
   }
-
-  if (response.status === 529 && (slowStatus === "active" || slowStatus === undefined)) {
-    return waitOrGiveUp(key, e, wait, "capacity-busy", now, random, waitCeilingMs);
-  }
-
-  // Window rollover announced by the server → the wall is gone, drop the header.
-  const reset5h = parseClaudeHeaderNumber(headers, CLAUDE_UNIFIED_HEADERS.reset5h);
-  if (reset5h !== undefined && reset5h >= e.state.resetsAtSeconds + D.rolloverToleranceSeconds) {
-    endEntry(key, e, "reset", now);
-    return { kind: "ended", reason: "reset" };
-  }
-
-  if (slowStatus === "active") {
-    e.requestsServed += 1;
-    wait.current = null;
-  } else if (slowStatus === "not_needed") {
-    e.requestsServedStandard += 1;
-    wait.current = null;
-  } else if (isOverageTakeover(slowStatus, headers)) {
-    endEntry(key, e, "extra_usage", now);
-    return { kind: "ended", reason: "extra_usage" };
-  }
-  return { kind: "none" };
+  return observeSuccessResponse(ctx, slowStatus);
 }
 
 /**
@@ -550,17 +585,16 @@ export async function handleClaudeUsageLimitResponse(opts: {
   const now = opts.now ?? Date.now();
   const { key, config, response, wait } = opts;
   const headers = response.headers;
-  const offer = parseClaudeSlowOffer(headers);
-  const atWall = isClaudeUsageWall(headers) || offer !== undefined;
+  const atWall = isClaudeUsageWall(headers) || parseClaudeSlowOffer(headers) !== undefined;
 
   if (isClaudeLowPriorityActive(key, now)) {
+    // Raced activation (see `sentSlow`): a header-less sibling's outcome is not lane
+    // telemetry. Re-send it on the lane if it hit the wall, otherwise ignore it.
     if (opts.sentSlow === false) {
-      // Raced activation (see `sentSlow`): a header-less request's outcome is not lane
-      // telemetry. Re-send it on the lane if it hit the wall, otherwise ignore it.
-      if (response.status === 429 && atWall) {
-        return { kind: "retry", delayMs: 0, via: "low-priority-accepted" };
-      }
-      return { kind: "none" };
+      const rejoin = response.status === 429 && atWall;
+      return rejoin
+        ? { kind: "retry", delayMs: 0, via: "low-priority-accepted" }
+        : { kind: "none" };
     }
     return observeClaudeLowPriorityResponse(
       key,
@@ -572,21 +606,11 @@ export async function handleClaudeUsageLimitResponse(opts: {
     );
   }
 
-  if (response.status !== 429) return { kind: "none" };
-  if (!config.lowPriorityMode && !config.autoLimitReset) return { kind: "none" };
-  if (!atWall) return { kind: "none" };
+  const optedIn = config.lowPriorityMode || config.autoLimitReset;
+  if (response.status !== 429 || !optedIn || !atWall) return { kind: "none" };
 
-  if (config.autoLimitReset && opts.claimLimitReset) {
-    const claim = parseClaudeRepresentativeClaim(headers);
-    if (claim === undefined || claim === "five_hour") {
-      let reset = false;
-      try {
-        reset = await opts.claimLimitReset();
-      } catch {
-        reset = false;
-      }
-      if (reset) return { kind: "retry", delayMs: 0, via: "limit-reset" };
-    }
+  if (await shouldClaimLimitReset(config, headers, opts.claimLimitReset)) {
+    return { kind: "retry", delayMs: 0, via: "limit-reset" };
   }
 
   if (config.lowPriorityMode && tryActivateClaudeLowPriority(key, headers, now)) {
@@ -595,6 +619,25 @@ export async function handleClaudeUsageLimitResponse(opts: {
   }
 
   return { kind: "none" };
+}
+
+/**
+ * Opt-in weekly session-limit reset, attempted before the slow lane. Only for a wall that
+ * blames the 5-hour window (or names no window at all); a failing claim is never fatal.
+ */
+async function shouldClaimLimitReset(
+  config: ClaudeUsageLimitConfig,
+  headers: HeaderSource,
+  claimLimitReset: (() => Promise<boolean>) | undefined
+): Promise<boolean> {
+  if (!config.autoLimitReset || !claimLimitReset) return false;
+  const claim = parseClaudeRepresentativeClaim(headers);
+  if (claim !== undefined && claim !== "five_hour") return false;
+  try {
+    return await claimLimitReset();
+  } catch {
+    return false;
+  }
 }
 
 export function createClaudeLowPriorityWait(): ClaudeLowPriorityWait {

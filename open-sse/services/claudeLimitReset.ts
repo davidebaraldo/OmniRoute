@@ -287,30 +287,71 @@ export async function attemptClaudeLimitReset(opts: {
   return run;
 }
 
+/** Memoise "do not re-query before": the announced instant when it is in the future, else `fallbackMs` from now. */
+function memoiseNotBefore(
+  key: string,
+  announcedAt: string | null,
+  now: number,
+  fallbackMs: number
+) {
+  const next = parseIsoMs(announcedAt);
+  memoise(notBefore, key, next !== undefined && next > now ? next : now + fallbackMs);
+}
+
+/** The status half: is a reset actually on offer for this account right now? */
+async function resolveLimitResetOffer(
+  opts: Parameters<typeof attemptClaudeLimitReset>[0],
+  now: number,
+  fetchImpl: FetchLike
+): Promise<ClaudeLimitResetAttempt | null> {
+  const status = await fetchClaudeLimitResetStatus(opts.accessToken, fetchImpl);
+  if (!status) {
+    memoise(notBefore, opts.key, now + CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS);
+    return { reset: false, outcome: "no_status", nextAvailableAt: null };
+  }
+  if (status.eligible && status.arm === "reset" && status.available) return null;
+  memoiseNotBefore(opts.key, status.nextAvailableAt, now, CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS);
+  opts.log?.info?.(
+    "CLAUDE_LIMIT_RESET",
+    `not offered (eligible=${status.eligible} arm=${status.arm ?? "-"} available=${status.available} reason=${status.ineligibleReason ?? "-"})`
+  );
+  return { reset: false, outcome: "not_offered", nextAvailableAt: status.nextAvailableAt };
+}
+
+/** The claim half: POST the reset and memoise the outcome. */
+async function runLimitResetClaim(
+  opts: Parameters<typeof attemptClaudeLimitReset>[0],
+  now: number,
+  fetchImpl: FetchLike,
+  organizationUuid: string
+): Promise<ClaudeLimitResetAttempt> {
+  const claim = await claimClaudeLimitReset(opts.accessToken, organizationUuid, fetchImpl);
+  const granted = claim.result === "reset" || claim.result === "not_limited";
+  const spent = granted || claim.result === "already_used";
+  memoiseNotBefore(
+    opts.key,
+    claim.nextAvailableAt,
+    now,
+    spent ? CLAUDE_LIMIT_RESET_WEEK_MS : CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS
+  );
+  if (granted) memoise(recentResetUntil, opts.key, now + CLAUDE_LIMIT_RESET_RECENT_WINDOW_MS);
+  opts.log?.info?.(
+    "CLAUDE_LIMIT_RESET",
+    granted
+      ? `${claim.result} — next reset available ${claim.nextAvailableAt ?? "in a week"}`
+      : `claim result=${claim.result}`
+  );
+  return { reset: granted, outcome: claim.result, nextAvailableAt: claim.nextAvailableAt };
+}
+
 async function runClaudeLimitResetAttempt(
   opts: Parameters<typeof attemptClaudeLimitReset>[0],
   now: number
 ): Promise<ClaudeLimitResetAttempt> {
   const fetchImpl = opts.fetchImpl ?? fetch;
 
-  const status = await fetchClaudeLimitResetStatus(opts.accessToken, fetchImpl);
-  if (!status) {
-    memoise(notBefore, opts.key, now + CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS);
-    return { reset: false, outcome: "no_status", nextAvailableAt: null };
-  }
-  if (!status.eligible || status.arm !== "reset" || !status.available) {
-    const next = parseIsoMs(status.nextAvailableAt);
-    memoise(
-      notBefore,
-      opts.key,
-      next !== undefined && next > now ? next : now + CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS
-    );
-    opts.log?.info?.(
-      "CLAUDE_LIMIT_RESET",
-      `not offered (eligible=${status.eligible} arm=${status.arm ?? "-"} available=${status.available} reason=${status.ineligibleReason ?? "-"})`
-    );
-    return { reset: false, outcome: "not_offered", nextAvailableAt: status.nextAvailableAt };
-  }
+  const notOffered = await resolveLimitResetOffer(opts, now, fetchImpl);
+  if (notOffered) return notOffered;
 
   const orgUuid = await resolveClaudeOrganizationUuid(opts.providerSpecificData, opts.accessToken);
   if (!orgUuid) {
@@ -322,35 +363,7 @@ async function runClaudeLimitResetAttempt(
     return { reset: false, outcome: "no_organization", nextAvailableAt: null };
   }
 
-  const claim = await claimClaudeLimitReset(opts.accessToken, orgUuid, fetchImpl);
-  const next = parseIsoMs(claim.nextAvailableAt);
-  switch (claim.result) {
-    case "reset":
-    case "not_limited":
-      memoise(
-        notBefore,
-        opts.key,
-        next !== undefined && next > now ? next : now + CLAUDE_LIMIT_RESET_WEEK_MS
-      );
-      memoise(recentResetUntil, opts.key, now + CLAUDE_LIMIT_RESET_RECENT_WINDOW_MS);
-      opts.log?.info?.(
-        "CLAUDE_LIMIT_RESET",
-        `${claim.result} — next reset available ${claim.nextAvailableAt ?? "in a week"}`
-      );
-      return { reset: true, outcome: claim.result, nextAvailableAt: claim.nextAvailableAt };
-    case "already_used":
-      memoise(
-        notBefore,
-        opts.key,
-        next !== undefined && next > now ? next : now + CLAUDE_LIMIT_RESET_WEEK_MS
-      );
-      break;
-    default:
-      memoise(notBefore, opts.key, now + CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS);
-      break;
-  }
-  opts.log?.info?.("CLAUDE_LIMIT_RESET", `claim result=${claim.result}`);
-  return { reset: false, outcome: claim.result, nextAvailableAt: claim.nextAvailableAt };
+  return runLimitResetClaim(opts, now, fetchImpl, orgUuid);
 }
 
 /** Test-only: forget every memoised "not before" / recent reset / in-flight attempt. */
