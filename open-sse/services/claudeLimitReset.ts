@@ -26,6 +26,7 @@
  */
 
 import { fetchClaudeBootstrap, getClaudeCodeVersion } from "../executors/claudeIdentity.ts";
+import { setBoundedEntry } from "./claudeLowPriority.ts";
 
 type JsonRecord = Record<string, unknown>;
 type FetchLike = typeof fetch;
@@ -218,9 +219,16 @@ export async function resolveClaudeOrganizationUuid(
  */
 export const CLAUDE_LIMIT_RESET_RECENT_WINDOW_MS = 60_000;
 
+/** FIFO cap for the per-connection memos — see CLAUDE_LOW_PRIORITY_CACHE_LIMIT for the why. */
+export const CLAUDE_LIMIT_RESET_CACHE_LIMIT = 10_000;
+
 const notBefore = new Map<string, number>();
 const recentResetUntil = new Map<string, number>();
 const inflight = new Map<string, Promise<ClaudeLimitResetAttempt>>();
+
+function memoise(map: Map<string, number>, key: string, value: number): void {
+  setBoundedEntry(map, key, value, CLAUDE_LIMIT_RESET_CACHE_LIMIT);
+}
 
 function parseIsoMs(value: string | null): number | undefined {
   if (!value) return undefined;
@@ -287,12 +295,13 @@ async function runClaudeLimitResetAttempt(
 
   const status = await fetchClaudeLimitResetStatus(opts.accessToken, fetchImpl);
   if (!status) {
-    notBefore.set(opts.key, now + CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS);
+    memoise(notBefore, opts.key, now + CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS);
     return { reset: false, outcome: "no_status", nextAvailableAt: null };
   }
   if (!status.eligible || status.arm !== "reset" || !status.available) {
     const next = parseIsoMs(status.nextAvailableAt);
-    notBefore.set(
+    memoise(
+      notBefore,
       opts.key,
       next !== undefined && next > now ? next : now + CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS
     );
@@ -305,7 +314,7 @@ async function runClaudeLimitResetAttempt(
 
   const orgUuid = await resolveClaudeOrganizationUuid(opts.providerSpecificData, opts.accessToken);
   if (!orgUuid) {
-    notBefore.set(opts.key, now + CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS);
+    memoise(notBefore, opts.key, now + CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS);
     opts.log?.warn?.(
       "CLAUDE_LIMIT_RESET",
       "no organization UUID for this connection; cannot claim"
@@ -318,24 +327,26 @@ async function runClaudeLimitResetAttempt(
   switch (claim.result) {
     case "reset":
     case "not_limited":
-      notBefore.set(
+      memoise(
+        notBefore,
         opts.key,
         next !== undefined && next > now ? next : now + CLAUDE_LIMIT_RESET_WEEK_MS
       );
-      recentResetUntil.set(opts.key, now + CLAUDE_LIMIT_RESET_RECENT_WINDOW_MS);
+      memoise(recentResetUntil, opts.key, now + CLAUDE_LIMIT_RESET_RECENT_WINDOW_MS);
       opts.log?.info?.(
         "CLAUDE_LIMIT_RESET",
         `${claim.result} — next reset available ${claim.nextAvailableAt ?? "in a week"}`
       );
       return { reset: true, outcome: claim.result, nextAvailableAt: claim.nextAvailableAt };
     case "already_used":
-      notBefore.set(
+      memoise(
+        notBefore,
         opts.key,
         next !== undefined && next > now ? next : now + CLAUDE_LIMIT_RESET_WEEK_MS
       );
       break;
     default:
-      notBefore.set(opts.key, now + CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS);
+      memoise(notBefore, opts.key, now + CLAUDE_LIMIT_RESET_RETRY_BACKOFF_MS);
       break;
   }
   opts.log?.info?.("CLAUDE_LIMIT_RESET", `claim result=${claim.result}`);

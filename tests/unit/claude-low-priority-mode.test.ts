@@ -334,6 +334,86 @@ test("active: terminal verdicts end the lane and let the 429 reach the cooldown 
   }
 });
 
+test("active: ineligible + overage-in-use ends as extra_usage on a 429 too, not plain ineligible", () => {
+  // The wall verdict normally arrives ON the 429, so the overage takeover must win over
+  // the generic `ineligible` mapping there — extra_usage is the state the rest of the
+  // codebase keys on (src/lib/providers/claudeExtraUsage.ts).
+  tryActivateClaudeLowPriority("c1", wall429Headers(), NOW);
+  const d = observeClaudeLowPriorityResponse(
+    "c1",
+    {
+      status: 429,
+      headers: {
+        "anthropic-ratelimit-unified-slow-status": "ineligible",
+        "anthropic-ratelimit-unified-overage-in-use": "true",
+      },
+    },
+    createClaudeLowPriorityWait(),
+    NOW
+  );
+  assert.deepEqual(d, { kind: "ended", reason: "extra_usage" });
+  assert.equal(isClaudeLowPriorityActive("c1", NOW), false);
+});
+
+test("active: overage-in-use false or absent keeps the plain ineligible verdict", () => {
+  for (const extra of [{}, { "anthropic-ratelimit-unified-overage-in-use": "false" }]) {
+    _resetClaudeLowPriorityState();
+    tryActivateClaudeLowPriority("c1", wall429Headers(), NOW);
+    const d = observeClaudeLowPriorityResponse(
+      "c1",
+      {
+        status: 429,
+        headers: { "anthropic-ratelimit-unified-slow-status": "ineligible", ...extra },
+      },
+      createClaudeLowPriorityWait(),
+      NOW
+    );
+    assert.deepEqual(d, { kind: "ended", reason: "ineligible" });
+  }
+});
+
+test("active: waitCeilingMs caps the wait so the caller's own timeout cannot abort it mid-sleep", () => {
+  tryActivateClaudeLowPriority("c1", wall429Headers(), NOW); // retry-after 20s, max-wait 20min
+  const wait = createClaudeLowPriorityWait();
+  const busy = { status: 429, headers: { "anthropic-ratelimit-unified-slow-status": "slot_busy" } };
+
+  // Ceiling below the server's retry-after: the sleep is clamped to what is left.
+  const d1 = observeClaudeLowPriorityResponse("c1", busy, wait, NOW, () => 0.5, 8_000);
+  assert.deepEqual(d1, { kind: "retry", delayMs: 8_000, via: "slot-busy" });
+
+  // Ceiling reached → graceful max_wait end (+ cool-off), never a mid-sleep abort.
+  const d2 = observeClaudeLowPriorityResponse("c1", busy, wait, NOW + 8_000, () => 0.5, 8_000);
+  assert.deepEqual(d2, { kind: "ended", reason: "max_wait" });
+  assert.equal(isClaudeLowPriorityActive("c1", NOW + 8_000), false);
+
+  // A ceiling of 0 (budget already spent) gives up immediately instead of sleeping.
+  _resetClaudeLowPriorityState();
+  tryActivateClaudeLowPriority("c2", wall429Headers(), NOW);
+  const d3 = observeClaudeLowPriorityResponse(
+    "c2",
+    busy,
+    createClaudeLowPriorityWait(),
+    NOW,
+    () => 0.5,
+    0
+  );
+  assert.deepEqual(d3, { kind: "ended", reason: "max_wait" });
+});
+
+test("active: no ceiling keeps the server-announced max-wait semantics", () => {
+  tryActivateClaudeLowPriority("c1", wall429Headers(), NOW);
+  const wait = createClaudeLowPriorityWait();
+  const busy = { status: 429, headers: { "anthropic-ratelimit-unified-slow-status": "slot_busy" } };
+  assert.deepEqual(
+    observeClaudeLowPriorityResponse("c1", busy, wait, NOW, () => 0.5),
+    {
+      kind: "retry",
+      delayMs: 20_000,
+      via: "slot-busy",
+    }
+  );
+});
+
 test("active: budget_exhausted remembers the spent budget until its announced reset", () => {
   tryActivateClaudeLowPriority("c1", wall429Headers(), NOW);
   const budgetReset = Math.floor(NOW / 1000) + 2 * 86_400;

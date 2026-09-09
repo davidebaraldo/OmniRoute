@@ -83,7 +83,11 @@ function lower(headers: Record<string, string>): Record<string, string> {
   return Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
 }
 
-function run(connectionId: string, providerSpecificData: Record<string, unknown>) {
+function run(
+  connectionId: string,
+  providerSpecificData: Record<string, unknown>,
+  contextEditingEnabled = false
+) {
   return new DefaultExecutor("claude").execute({
     model: "claude-opus-4-8",
     body: { model: "claude-opus-4-8", messages: [{ role: "user", content: "hi" }], max_tokens: 8 },
@@ -94,7 +98,7 @@ function run(connectionId: string, providerSpecificData: Record<string, unknown>
       providerSpecificData,
     },
     clientHeaders: { "user-agent": "Cursor/1.0" },
-    contextEditing: { enabled: false },
+    contextEditing: { enabled: contextEditingEnabled },
     // Combo-style: the generic 2×2s intra-URL 429 retry is skipped so the test only
     // exercises the lane's own retry (which runs regardless of this flag).
     skipUpstreamRetry: true,
@@ -169,6 +173,32 @@ test("lane state is per connection: another account still sees its own wall", as
     assert.equal(b.response.status, 200);
     assert.equal(lower(calls[2].headers)["anthropic-usage-limit"], undefined);
     assert.equal(lower(calls[3].headers)["anthropic-usage-limit"], "slow");
+  } finally {
+    restore();
+  }
+});
+
+test("a wall 429 that only surfaces after a 400-driven intra-attempt retry is still intercepted", async () => {
+  // The context-editing 400 fallback re-fetches the same URL and REPLACES `response`.
+  // The usage-wall check must classify that final response, otherwise the offer is missed
+  // and the 429 reaches chatCore, cooling the connection down — the exact opposite of
+  // what lowPriorityMode is for.
+  const badRequest = () =>
+    new Response(JSON.stringify({ error: { message: "context_management not supported" } }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  const { calls, restore } = mockFetch([
+    badRequest, // 1st: 400 → context-editing fallback re-fetches
+    () => wall429(), // 2nd: the wall shows up only here
+    () => ok({ "anthropic-ratelimit-unified-slow-status": "active" }), // 3rd: lane retry
+  ]);
+  try {
+    const result = await run("conn-400-then-wall", { lowPriorityMode: true }, true);
+    assert.equal(result.response.status, 200, "the late wall 429 was intercepted, not surfaced");
+    assert.equal(calls.length, 3);
+    assert.equal(lower(calls[1].headers)["anthropic-usage-limit"], undefined);
+    assert.equal(lower(calls[2].headers)["anthropic-usage-limit"], "slow");
   } finally {
     restore();
   }

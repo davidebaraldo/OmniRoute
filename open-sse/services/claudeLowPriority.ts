@@ -148,8 +148,25 @@ type Entry = {
 
 type HeaderSource = Headers | Record<string, string | undefined> | null | undefined;
 
+/**
+ * FIFO cap on the per-connection state map. The key is the connection id, but falls back to
+ * the access token for callers without one — and OAuth tokens rotate on every refresh, so an
+ * uncapped map would grow for the process lifetime. Same bound and eviction policy as the
+ * identity caches in `open-sse/executors/claudeIdentity.ts`.
+ */
+export const CLAUDE_LOW_PRIORITY_CACHE_LIMIT = 10_000;
+
 const entries = new Map<string, Entry>();
 const D = CLAUDE_LOW_PRIORITY_DEFAULTS;
+
+/** Insert with FIFO eviction once the map reaches `max`. JS Maps preserve insertion order. */
+export function setBoundedEntry<K, V>(map: Map<K, V>, key: K, value: V, max: number): void {
+  if (!map.has(key) && map.size >= max) {
+    const oldest = map.keys().next().value as K | undefined;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
 
 function asRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
@@ -249,7 +266,7 @@ function entryFor(key: string): Entry {
   let e = entries.get(key);
   if (!e) {
     e = freshEntry();
-    entries.set(key, e);
+    setBoundedEntry(entries, key, e, CLAUDE_LOW_PRIORITY_CACHE_LIMIT);
   }
   return e;
 }
@@ -364,10 +381,23 @@ export function tryActivateClaudeLowPriority(
   return true;
 }
 
+/** `ineligible` + paid overage now covering the wall — the lane is no longer the thing serving us. */
+function isOverageTakeover(status: ClaudeSlowStatus | undefined, headers: HeaderSource): boolean {
+  return (
+    status === "ineligible" &&
+    getClaudeHeader(headers, CLAUDE_UNIFIED_HEADERS.overageInUse) === "true"
+  );
+}
+
 function mapEndReason(
   status: ClaudeSlowStatus | undefined,
   headers: HeaderSource
 ): ClaudeLowPriorityEndReason | null {
+  // Overage takeover wins over the plain `ineligible` mapping on every status, so a wall
+  // 429 that also announces paid overage ends the lane as `extra_usage` (the state the
+  // rest of the codebase keys on — see src/lib/providers/claudeExtraUsage.ts), not as a
+  // generic ineligibility.
+  if (isOverageTakeover(status, headers)) return "extra_usage";
   switch (status) {
     case "weekly_limit":
       return "weekly";
@@ -396,7 +426,8 @@ function waitOrGiveUp(
   wait: ClaudeLowPriorityWait,
   via: "slot-busy" | "capacity-busy",
   now: number,
-  random: () => number
+  random: () => number,
+  waitCeilingMs?: number
 ): ClaudeUsageLimitDecision {
   if (e.state.phase !== "active") return { kind: "none" };
   const acceptedAtMs = e.state.acceptedAtMs;
@@ -404,13 +435,22 @@ function waitOrGiveUp(
     wait.current && wait.current.sinceMs >= acceptedAtMs
       ? wait.current
       : { sinceMs: now, attempts: 0, nextTryAtMs: now };
-  if (now - current.sinceMs >= e.maxWaitMs) {
+  // The caller's own budget (the request's upstream timeout) caps the server-announced
+  // max-wait: sleeping past it would be aborted mid-wait, surfacing a hard TimeoutError
+  // instead of the graceful max_wait end + cool-off.
+  const effectiveMaxWaitMs =
+    waitCeilingMs === undefined ? e.maxWaitMs : Math.min(e.maxWaitMs, Math.max(0, waitCeilingMs));
+  const waitedMs = now - current.sinceMs;
+  if (waitedMs >= effectiveMaxWaitMs) {
     wait.current = null;
     endEntry(key, e, "max_wait", now);
     return { kind: "ended", reason: "max_wait" };
   }
   const jitter = 1 + (random() * 2 - 1) * D.jitter;
-  const delayMs = Math.max(0, Math.round(e.retryAfterMs * jitter));
+  const delayMs = Math.min(
+    Math.max(0, Math.round(e.retryAfterMs * jitter)),
+    effectiveMaxWaitMs - waitedMs
+  );
   wait.current = {
     sinceMs: current.sinceMs,
     attempts: current.attempts + 1,
@@ -429,7 +469,8 @@ export function observeClaudeLowPriorityResponse(
   response: { status: number; headers: HeaderSource },
   wait: ClaudeLowPriorityWait,
   now: number = Date.now(),
-  random: () => number = Math.random
+  random: () => number = Math.random,
+  waitCeilingMs?: number
 ): ClaudeUsageLimitDecision {
   const e = entries.get(key);
   if (!e) return { kind: "none" };
@@ -447,12 +488,14 @@ export function observeClaudeLowPriorityResponse(
       endEntry(key, e, reason, now);
       return { kind: "ended", reason };
     }
-    if (slowStatus === "slot_busy") return waitOrGiveUp(key, e, wait, "slot-busy", now, random);
+    if (slowStatus === "slot_busy") {
+      return waitOrGiveUp(key, e, wait, "slot-busy", now, random, waitCeilingMs);
+    }
     return { kind: "none" };
   }
 
   if (response.status === 529 && (slowStatus === "active" || slowStatus === undefined)) {
-    return waitOrGiveUp(key, e, wait, "capacity-busy", now, random);
+    return waitOrGiveUp(key, e, wait, "capacity-busy", now, random, waitCeilingMs);
   }
 
   // Window rollover announced by the server → the wall is gone, drop the header.
@@ -468,10 +511,7 @@ export function observeClaudeLowPriorityResponse(
   } else if (slowStatus === "not_needed") {
     e.requestsServedStandard += 1;
     wait.current = null;
-  } else if (
-    slowStatus === "ineligible" &&
-    getClaudeHeader(headers, CLAUDE_UNIFIED_HEADERS.overageInUse) === "true"
-  ) {
+  } else if (isOverageTakeover(slowStatus, headers)) {
     endEntry(key, e, "extra_usage", now);
     return { kind: "ended", reason: "extra_usage" };
   }
@@ -499,6 +539,11 @@ export async function handleClaudeUsageLimitResponse(opts: {
    * as a verdict on the lane — it just joins it. Defaults to "matches the lane state".
    */
   sentSlow?: boolean;
+  /**
+   * The caller's remaining budget for THIS request (its upstream timeout). Caps the
+   * server-announced max-wait so the lane ends gracefully instead of being aborted mid-sleep.
+   */
+  waitCeilingMs?: number;
   now?: number;
   random?: () => number;
 }): Promise<ClaudeUsageLimitDecision> {
@@ -517,7 +562,14 @@ export async function handleClaudeUsageLimitResponse(opts: {
       }
       return { kind: "none" };
     }
-    return observeClaudeLowPriorityResponse(key, response, wait, now, opts.random);
+    return observeClaudeLowPriorityResponse(
+      key,
+      response,
+      wait,
+      now,
+      opts.random,
+      opts.waitCeilingMs
+    );
   }
 
   if (response.status !== 429) return { kind: "none" };

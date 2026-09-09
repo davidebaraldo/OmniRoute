@@ -138,11 +138,19 @@ connection** (Edit connection → Claude section → `lowPriorityMode` / `autoLi
   keep the lane; `slot_busy` (429) or a `529` wait the server's
   `anthropic-ratelimit-unified-slow-retry-after` (default 20s, clamp 5–600s, ±30% jitter)
   and retry, bounded by `anthropic-ratelimit-unified-slow-max-wait` (default 20 min, clamp
-  1 min–6 h) — past that the lane ends and a 10-minute cool-off blocks re-acceptance.
+  1 min–6 h) — past that the lane ends and a 10-minute cool-off blocks re-acceptance. The
+  wait is additionally capped by what is left of the request's own upstream-start timeout
+  (`resolveFetchStartTimeout`, 10 min by default) minus a 5 s margin: without that cap the
+  20-minute default max-wait would outlive the request and the sleep would be aborted
+  mid-wait, surfacing a `TimeoutError` instead of the graceful `max_wait` end + cool-off.
 - `weekly_limit` / `budget_exhausted` / `off` / `ineligible`, a 5h-window rollover, or
-  `ineligible` + `anthropic-ratelimit-unified-overage-in-use: true` end the lane; the
+  `ineligible` + `anthropic-ratelimit-unified-overage-in-use: true` (which ends it as
+  `extra_usage` on any status, since paid overage now covers the wall) end the lane; the
   response then flows to the normal cooldown path. `budget_exhausted` is remembered until
   the announced budget reset (≤ 8 days).
+- The wall check runs after the executor's own 400-driven intra-attempt retries (context
+  editing, thinking/effort clamps, param auto-learn), so a wall 429 that only surfaces on
+  one of those retries is still intercepted instead of reaching the cooldown path.
 - State is in-memory per connection (a restart costs one extra wall 429 to re-accept).
 
 **Session-limit reset** (`autoLimitReset`, tried before the lane when both are on):
