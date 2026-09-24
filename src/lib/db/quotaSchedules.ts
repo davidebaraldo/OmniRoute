@@ -4,7 +4,7 @@
  * Time-aware quota windows for a quota pool: when OmniRoute may use the pool's
  * accounts, how much upstream quota it must leave behind (`reserve_percent`),
  * and how much it may consume itself inside the window (`budget_*`).
- * See migration 182 and src/lib/quota/schedules.ts for the semantics.
+ * See migration 187 and src/lib/quota/schedules.ts for the semantics.
  *
  * All SQL goes through prepared statements — never raw string interpolation
  * (Hard Rule #5). Import getDbInstance from ./core (Hard Rule #5).
